@@ -18,7 +18,6 @@ from functools import lru_cache
 # ── Utility: sliding window helpers ─────────────────────────────────────────
 
 def _sliding_sma(arr, length):
-    """Return list of SMA values. Uses running sum for O(n)."""
     n = len(arr)
     out = [None] * n
     if n < length:
@@ -131,20 +130,26 @@ def macd(values, fast=12, slow=26, signal_period=9):
 
 
 def bollinger_bands(values, period=20, num_std=2.0):
-    """TradingView uses population std (n, not n-1)."""
     n = len(values)
     middle = _sliding_sma(values, period)
     upper = [None] * n
     lower = [None] * n
-
-    for i in range(period - 1, n):
-        window = values[i - period + 1:i + 1]
-        mean = middle[i]
-        # population std
-        var = sum((x - mean) * (x - mean) for x in window) / period
-        std = math.sqrt(var)
-        upper[i] = mean + num_std * std
-        lower[i] = mean - num_std * std
+    if n >= period:
+        sum_x = sum(values[:period])
+        sum_x2 = sum(x * x for x in values[:period])
+        for i in range(period - 1, n):
+            mean = middle[i]
+            variance = sum_x2 / period - mean * mean
+            if variance < 1e-15:
+                variance = 0.0
+            std = math.sqrt(variance)
+            upper[i] = mean + num_std * std
+            lower[i] = mean - num_std * std
+            if i + 1 < n:
+                old_val = values[i - period + 1]
+                new_val = values[i + 1]
+                sum_x += new_val - old_val
+                sum_x2 += new_val * new_val - old_val * old_val
     return upper, middle, lower
 
 
@@ -185,8 +190,13 @@ def supertrend(highs, lows, closes, period=10, multiplier=3.0):
         lower_band[i] = hl2 - multiplier * atr_vals[i]
 
         if i == period:
-            direction[i] = 1
-            st[i] = lower_band[i]
+            prev_close = closes[i - 1]
+            if prev_close > upper_band[i]:
+                direction[i] = -1
+                st[i] = upper_band[i]
+            else:
+                direction[i] = 1
+                st[i] = lower_band[i]
             continue
 
         # band clamping to prevent narrowing

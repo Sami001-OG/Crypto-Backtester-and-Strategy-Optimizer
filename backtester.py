@@ -25,19 +25,31 @@ def load_data(filename):
         raise FileNotFoundError(f"Data file not found: {filepath}")
     rows = []
     with open(filepath, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
+        header = next(reader)
+        ci = {name: idx for idx, name in enumerate(header)}
+        t_col = ci.get("datetime", ci.get("open_time", 0))
+        ot_col = ci["open_time"]
+        o_col = ci["open"]
+        h_col = ci["high"]
+        l_col = ci["low"]
+        c_col = ci["close"]
+        v_col = ci["volume"]
+        ct_col = ci["close_time"]
+        qv_col = ci["quote_volume"]
+        tr_col = ci["trades"]
         for row in reader:
             rows.append({
-                "datetime": row.get("datetime", row.get("open_time", "")),
-                "open_time": row["open_time"],
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-                "volume": float(row["volume"]),
-                "close_time": row["close_time"],
-                "quote_volume": float(row["quote_volume"]),
-                "trades": int(row["trades"]),
+                "datetime": row[t_col],
+                "open_time": row[ot_col],
+                "open": float(row[o_col]),
+                "high": float(row[h_col]),
+                "low": float(row[l_col]),
+                "close": float(row[c_col]),
+                "volume": float(row[v_col]),
+                "close_time": row[ct_col],
+                "quote_volume": float(row[qv_col]),
+                "trades": int(row[tr_col]),
             })
     return rows
 
