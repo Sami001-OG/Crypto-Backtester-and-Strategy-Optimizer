@@ -174,52 +174,52 @@ def atr(highs, lows, closes, period=14):
 
 
 def supertrend(highs, lows, closes, period=10, multiplier=3.0):
-    """Supertrend matching TradingView pine v5 ta.supertrend(src=hl2, ...)."""
+    """
+    SuperTrend matching TradingView pine v5 ta.supertrend(hl2, mult, period).
+
+    Convention used here: direction = 1 means uptrend (SuperTrend sits on the
+    lower band and acts as support); direction = -1 means downtrend (SuperTrend
+    sits on the upper band). The trailing bands ratchet each bar — the lower band
+    only moves up while price holds above it, the upper band only moves down while
+    price holds below it — which is what makes the trend flip on a real break.
+    """
     n = len(closes)
     atr_vals = atr(highs, lows, closes, period)
     st = [None] * n
     direction = [None] * n
-    upper_band = [None] * n
-    lower_band = [None] * n
+    final_upper = [None] * n
+    final_lower = [None] * n
 
     for i in range(period, n):
         if atr_vals[i] is None:
             continue
         hl2 = (highs[i] + lows[i]) / 2.0
-        upper_band[i] = hl2 + multiplier * atr_vals[i]
-        lower_band[i] = hl2 - multiplier * atr_vals[i]
+        basic_upper = hl2 + multiplier * atr_vals[i]
+        basic_lower = hl2 - multiplier * atr_vals[i]
 
-        if i == period:
-            prev_close = closes[i - 1]
-            if prev_close > upper_band[i]:
-                direction[i] = -1
-                st[i] = upper_band[i]
-            else:
-                direction[i] = 1
-                st[i] = lower_band[i]
+        if final_upper[i - 1] is None or final_lower[i - 1] is None:
+            # First computable bar: seed bands and pick a starting trend.
+            final_upper[i] = basic_upper
+            final_lower[i] = basic_lower
+            direction[i] = 1 if closes[i] >= hl2 else -1
+            st[i] = final_lower[i] if direction[i] == 1 else final_upper[i]
             continue
 
-        # band clamping to prevent narrowing
-        if upper_band[i] < upper_band[i - 1] if upper_band[i - 1] is not None else False:
-            upper_band[i] = upper_band[i - 1]
-        if lower_band[i] > lower_band[i - 1] if lower_band[i - 1] is not None else False:
-            lower_band[i] = lower_band[i - 1]
+        prev_close = closes[i - 1]
+        # Ratchet the trailing bands (pine v5 final-band rules).
+        final_lower[i] = (basic_lower
+                          if basic_lower > final_lower[i - 1] or prev_close < final_lower[i - 1]
+                          else final_lower[i - 1])
+        final_upper[i] = (basic_upper
+                          if basic_upper < final_upper[i - 1] or prev_close > final_upper[i - 1]
+                          else final_upper[i - 1])
 
         prev_dir = direction[i - 1]
-        if prev_dir == 1:
-            if closes[i] < lower_band[i]:
-                direction[i] = -1
-                st[i] = upper_band[i]
-            else:
-                direction[i] = 1
-                st[i] = lower_band[i]
-        else:
-            if closes[i] > upper_band[i]:
-                direction[i] = 1
-                st[i] = lower_band[i]
-            else:
-                direction[i] = -1
-                st[i] = upper_band[i]
+        if prev_dir == -1:                       # was downtrend (SuperTrend = upper)
+            direction[i] = 1 if closes[i] > final_upper[i] else -1
+        else:                                     # was uptrend (SuperTrend = lower)
+            direction[i] = -1 if closes[i] < final_lower[i] else 1
+        st[i] = final_lower[i] if direction[i] == 1 else final_upper[i]
 
     return st, direction
 

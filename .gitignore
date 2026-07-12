@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Caches / pickles
+*.pkl
+_endellion_cache.pkl
+
+# Generated backtest output
+backtest_equity.csv
+backtest_trades.csv
+*_equity.csv
+*_trades.csv
+
+# Market data (downloaded/preprocessed, not source)
+*_1h.csv
+*_5m.csv
+*_15m.csv
+*_4h.csv
+*_1d.csv
+data/

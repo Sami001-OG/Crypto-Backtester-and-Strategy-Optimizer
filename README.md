@@ -56,12 +56,14 @@ Output:
 
 ## Execution Model
 
-Matches **TradingView's Strategy Tester** exactly:
+Matches **TradingView's Strategy Tester**:
 
-1. **Bar-magnitude**: signal generated at bar `i` → executes at bar `i+1` open (no lookahead bias)
-2. **Stop/Take-profit**: checked intra-bar using high/low — stop uses low for longs, take-profit uses high
-3. **Commission**: applied on every fill as % of order value (TV default: 0.04% for crypto)
-4. **Slippage**: configurable as % of price or tick count
+1. **Bar-magnitude**: signal generated at bar `i` → executes at bar `i+1` open (no lookahead). Entries *and* signal-based exits both fill at the next open — symmetric, no bias.
+2. **Stop/Take-profit**: checked intra-bar using high/low — stop uses low for longs (high for shorts), take-profit the opposite. Stop is evaluated before take-profit.
+3. **Commission**: applied on every fill as % of order value (TV default: 0.04% for crypto).
+4. **Slippage**: configurable as % of price or tick count (`tick_size` configurable).
+5. **Cash accounting**: equity equals cash whenever flat, for *any* position size — `qty_value < 100` keeps the remainder in cash, and shorts are modelled at 1x with margin held against notional.
+6. **Timeframe-aware**: the bar interval is inferred from timestamps, so Sharpe, Sortino, CAGR, exposure and trade durations are correct for 5m / 15m / 1h / 4h / 1d data.
 
 ---
 
@@ -119,6 +121,8 @@ Add your own — just write a function that returns `list[int]` (1=long, -1=shor
 
 ## Optimizer
 
+Brute-force: backtests **every** parameter combination for a given strategy/indicator and ranks them, so you can find the best-performing set. Ranking is descending by default, ascending for `max_drawdown_pct` / `total_fees`. `min_trades` filters degenerate combos. Parallelism uses **processes** (not threads), so pure-Python backtests actually use every core; data is loaded once per worker.
+
 ### Grid Search (parallel)
 
 ```python
@@ -127,12 +131,16 @@ from optimizer import grid_search
 best = grid_search(
     "BTC_1h.csv", "sma_crossover",
     {"fast_period": [10, 20, 50], "slow_period": [100, 200]},
-    rank_by="sharpe_ratio",  # or "total_return_pct", "profit_factor"
+    rank_by="sharpe_ratio",   # or "total_return_pct", "profit_factor", "calmar_ratio"
+    min_trades=10,            # skip combos with too few trades
     parallel=True,
 )
+best_params = best[0]["params"]
 ```
 
-### Walk-Forward
+### Walk-Forward (no lookahead)
+
+Grid-searches on the training slice **only**, then evaluates the winner out-of-sample:
 
 ```python
 from optimizer import walk_forward
@@ -158,7 +166,7 @@ fold_results = rolling_walk_forward(
 
 ### Adaptive Random Search
 
-For large parameter spaces (>10⁶ combos):
+For large parameter spaces (>10⁶ combos). Explores randomly, then refines around the best point found:
 
 ```python
 from optimizer import adaptive_search
@@ -169,6 +177,8 @@ best = adaptive_search(
     iterations=500,
 )
 ```
+
+Spec types: `(low, high, "int")`, `(low, high, "float")`, `(low, high, "bool")`, `(low, high, "choice", [a, b, c])`.
 
 ---
 
@@ -232,4 +242,4 @@ Backtester(
 
 ## Requirements
 
-Python 3.7+ — **no pip packages required** (standard library only: `csv`, `os`, `math`, `json`, `datetime`, `urllib`, `zipfile`, `io`, `itertools`, `concurrent.futures`)
+Python 3.7+ — **no pip packages required** (standard library only: `csv`, `os`, `math`, `datetime`, `random`, `urllib`, `zipfile`, `io`, `itertools`, `concurrent.futures`, `multiprocessing`)

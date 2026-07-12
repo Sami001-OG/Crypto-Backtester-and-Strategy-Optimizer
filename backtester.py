@@ -2,60 +2,122 @@
 Core backtesting engine — matches TradingView's bar-magnitude execution model.
 
 TradingView parity:
-  - Signals execute at next bar's open (no lookahead bias)
-  - Stop/take-profit checked bar-by-bar using high/low
-  - Commission on every fill (% of order value)
-  - 30+ metrics matching TV's Strategy Tester
-  - O(n) running computation, pre-extracted arrays for speed
+  - Signals generated at bar i (close) execute at bar i+1 open (no lookahead bias).
+    Entries AND exits both fill at the next bar's open — symmetric, no bias.
+  - Stop-loss / take-profit checked intra-bar using high/low (SL before TP).
+  - Commission charged on every fill (% of order value).
+  - Cash-based accounting: equity when flat == cash. Works for any position size
+    (qty_value < 100 keeps the remainder in cash) and for shorts (1x, margin-locked).
+  - Timeframe-aware ratios: bar interval is inferred from timestamps, so Sharpe,
+    Sortino, CAGR and exposure are correct for 5m / 15m / 1h / 4h / 1d data.
+  - O(n) running computation, pre-extracted arrays for speed.
 """
 
 import csv
 import os
 import math
 import datetime
-import time
-from collections import deque
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
+SECONDS_PER_YEAR = 365.25 * 24 * 3600.0
+_DT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d")
+
 
 def load_data(filename):
-    filepath = os.path.join(DATA_DIR, filename)
+    """
+    Load an OHLCV CSV. Required columns: open, high, low, close, volume.
+    A ``datetime`` column is used for labels/interval detection when present;
+    otherwise ``open_time`` (Unix ms) is used. ``close_time``, ``quote_volume``
+    and ``trades`` are optional and default sensibly when missing.
+    """
+    filepath = filename if os.path.isabs(filename) else os.path.join(DATA_DIR, filename)
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Data file not found: {filepath}")
     rows = []
     with open(filepath, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader)
-        ci = {name: idx for idx, name in enumerate(header)}
-        t_col = ci.get("datetime", ci.get("open_time", 0))
-        ot_col = ci["open_time"]
-        o_col = ci["open"]
-        h_col = ci["high"]
-        l_col = ci["low"]
-        c_col = ci["close"]
-        v_col = ci["volume"]
-        ct_col = ci["close_time"]
-        qv_col = ci["quote_volume"]
-        tr_col = ci["trades"]
+        ci = {name.strip(): idx for idx, name in enumerate(header)}
+
+        for req in ("open", "high", "low", "close", "volume"):
+            if req not in ci:
+                raise ValueError(f"CSV missing required column '{req}'. Found: {list(ci)}")
+
+        def col(name, default=None):
+            return ci[name] if name in ci else default
+
+        t_col = col("datetime", col("open_time", 0))
+        ot_col = col("open_time")
+        o_col, h_col, l_col, c_col, v_col = ci["open"], ci["high"], ci["low"], ci["close"], ci["volume"]
+        ct_col = col("close_time")
+        qv_col = col("quote_volume")
+        tr_col = col("trades")
+
         for row in reader:
+            if not row:
+                continue
             rows.append({
                 "datetime": row[t_col],
-                "open_time": row[ot_col],
+                "open_time": row[ot_col] if ot_col is not None else row[t_col],
                 "open": float(row[o_col]),
                 "high": float(row[h_col]),
                 "low": float(row[l_col]),
                 "close": float(row[c_col]),
                 "volume": float(row[v_col]),
-                "close_time": row[ct_col],
-                "quote_volume": float(row[qv_col]),
-                "trades": int(row[tr_col]),
+                "close_time": row[ct_col] if ct_col is not None else "",
+                "quote_volume": float(row[qv_col]) if qv_col is not None and row[qv_col] != "" else 0.0,
+                "trades": int(float(row[tr_col])) if tr_col is not None and row[tr_col] != "" else 0,
             })
     return rows
 
 
-def _row(data, idx, key):
-    return data[idx][key]
+def _parse_dt(s):
+    for fmt in _DT_FORMATS:
+        try:
+            return datetime.datetime.strptime(s, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _infer_interval_seconds(times, open_times):
+    """
+    Infer the bar interval (seconds) from the median gap between bars.
+    Tries the ``datetime`` strings first, then numeric ``open_time`` (ms or s).
+    Falls back to 3600s (1h) if nothing parses.
+    """
+    diffs = []
+    # Try parsed datetimes
+    prev = None
+    for s in times[:200]:
+        dt = _parse_dt(s)
+        if dt is not None:
+            if prev is not None:
+                d = (dt - prev).total_seconds()
+                if d > 0:
+                    diffs.append(d)
+            prev = dt
+    if not diffs and open_times:
+        prev_v = None
+        for s in open_times[:200]:
+            try:
+                v = float(s)
+            except (ValueError, TypeError):
+                prev_v = None
+                continue
+            if prev_v is not None:
+                d = v - prev_v
+                if d > 0:
+                    diffs.append(d)
+            prev_v = v
+        if diffs:
+            med = sorted(diffs)[len(diffs) // 2]
+            # open_time is usually milliseconds; normalise to seconds
+            return med / 1000.0 if med > 1e5 else med
+    if diffs:
+        return sorted(diffs)[len(diffs) // 2]
+    return 3600.0
 
 
 class Backtester:
@@ -63,38 +125,42 @@ class Backtester:
     TradingView-compatible backtester with bar-magnitude execution.
 
     Execution model (matches TV):
-      1. Signal generated at bar i (close) → executes at bar i+1 open
-      2. Stop-loss / take-profit checked intra-bar: SL uses bar low, TP uses bar high
-      3. Commission applied on both entry and exit (TV: % of order value)
-      4. Pyramiding: max N concurrent entries (default 1)
+      1. Signal at bar i (close) schedules a transition executed at bar i+1 open.
+      2. Stop-loss / take-profit checked intra-bar: SL uses bar low (long) /
+         high (short); TP the opposite. SL is checked before TP.
+      3. Commission applied on both entry and exit (% of order value).
+      4. Cash accounting: equity == cash whenever flat, for any qty_value / side.
 
     Parameters:
         initial_capital   - starting capital
-        fee_pct           - commission per trade (%) — TV default is 0.04% for crypto
-        slippage_ticks    - slippage in ticks
+        fee_pct           - commission per fill (%) — TV default 0.04% for crypto
+        slippage_ticks    - slippage in ticks (tick_size configurable)
         slippage_pct      - slippage as % of price
+        tick_size         - price value of one tick (default 0.01)
         stop_loss_pct     - stop loss % from entry (e.g. 2 = 2%)
         take_profit_pct   - take profit % from entry (e.g. 5 = 5%)
-        long_only         - if True, only long trades
-        pyramiding        - max concurrent entries (default 1)
-        qty_type          - "equity_pct" (default) or "fixed"
+        long_only         - if True, short signals just flatten instead of shorting
+        qty_type          - "equity_pct" (default) or "fixed" (fixed units)
         qty_value         - % of equity (0-100) or fixed units
     """
 
     def __init__(self, data, initial_capital=10000, fee_pct=0.04,
-                 slippage_ticks=0, slippage_pct=0.0,
+                 slippage_ticks=0, slippage_pct=0.0, tick_size=0.01,
                  stop_loss_pct=None, take_profit_pct=None,
                  long_only=True, pyramiding=1,
                  qty_type="equity_pct", qty_value=100):
+        if not data:
+            raise ValueError("data is empty")
         self.data = data
         self.initial_capital = float(initial_capital)
         self.fee_rate = fee_pct / 100.0
         self.slippage_rate = slippage_pct / 100.0
         self.slippage_ticks = slippage_ticks
+        self.tick_size = tick_size
         self.stop_loss_pct = stop_loss_pct / 100.0 if stop_loss_pct else None
         self.take_profit_pct = take_profit_pct / 100.0 if take_profit_pct else None
         self.long_only = long_only
-        self.pyramiding = pyramiding
+        self.pyramiding = pyramiding  # reserved (single-entry model)
         self.qty_type = qty_type
         self.qty_value = qty_value
 
@@ -105,178 +171,150 @@ class Backtester:
         self._close = [data[i]["close"] for i in range(n)]
         self._time = [data[i]["datetime"] for i in range(n)]
         self._n = n
+        self._interval = _infer_interval_seconds(
+            self._time, [data[i].get("open_time") for i in range(n)]
+        )
 
     def _slip(self, price, is_buy):
+        """Adverse slippage: buys fill higher, sells fill lower."""
         if self.slippage_ticks > 0:
-            return price + (self.slippage_ticks * 0.01 if is_buy else -self.slippage_ticks * 0.01)
+            adj = self.slippage_ticks * self.tick_size
+            return price + adj if is_buy else price - adj
         if self.slippage_rate > 0:
             return price * (1.0 + self.slippage_rate) if is_buy else price * (1.0 - self.slippage_rate)
         return price
+
+    def _size(self, cash, price):
+        """Notional (in quote currency) to allocate to a new position."""
+        if self.qty_type == "fixed":
+            notional = self.qty_value * price          # qty_value = fixed units
+        else:
+            notional = cash * (self.qty_value / 100.0)  # qty_value = % of equity
+        return max(0.0, min(notional, cash))
 
     def run(self, signals):
         n = self._n
         if len(signals) != n:
             raise ValueError(f"Signal length ({len(signals)}) != data length ({n})")
 
-        # State
         cash = self.initial_capital
         qty = 0.0
         entry_price = 0.0
+        entry_fee = 0.0
         entry_time = ""
-        pos_side = 0  # 1=long, -1=short, 0=flat
+        entry_bar = 0
+        pos_side = 0            # 1=long, -1=short, 0=flat
         total_fees = 0.0
-        pending_entry = None  # (direction, bar_index) to execute at next bar open
+        pending = None          # desired side to establish at the next bar's open
+        bars_in_market = 0
 
         equity_curve = [0.0] * n
         trades = []
 
-        i = 0
-        while i < n:
+        def open_position(side, raw_price, bar):
+            nonlocal cash, qty, entry_price, entry_fee, entry_time, entry_bar, pos_side, total_fees
+            price = self._slip(raw_price, side == 1)
+            if price <= 0:
+                return
+            notional = self._size(cash, price)
+            if notional <= 0:
+                return
+            fee = notional * self.fee_rate
+            qty = notional / price
+            entry_fee = fee
+            entry_price = price
+            entry_time = self._time[bar]
+            entry_bar = bar
+            pos_side = side
+            total_fees += fee
+            if side == 1:
+                cash -= notional + fee      # long ties up notional + pays fee
+            else:
+                cash -= fee                 # short: 1x margin held against notional, pay fee
+
+        def close_position(raw_price, bar, reason):
+            nonlocal cash, qty, entry_price, entry_fee, pos_side, total_fees
+            # Long exit is a SELL (slips down); short cover is a BUY (slips up).
+            price = self._slip(raw_price, pos_side == -1)
+            exit_fee = price * qty * self.fee_rate
+            total_fees += exit_fee
+            if pos_side == 1:
+                gross = (price - entry_price) * qty
+                cash += qty * price - exit_fee   # return notional + P&L, minus exit fee
+            else:
+                gross = (entry_price - price) * qty
+                cash += gross - exit_fee          # realise short P&L, minus exit fee
+            net = gross - entry_fee - exit_fee
+            side_str = "LONG" if pos_side == 1 else "SHORT"
+            trades.append(self._trade(entry_time, self._time[bar], side_str,
+                                      entry_price, price, qty, net, reason,
+                                      entry_bar, bar))
+            pos_side = 0
+            qty = 0.0
+            entry_price = 0.0
+            entry_fee = 0.0
+
+        for i in range(n):
             o = self._open[i]
             h = self._high[i]
             l = self._low[i]
             c = self._close[i]
-            t = self._time[i]
 
-            # ── Execute any pending entry at this bar's open ──
-            if pending_entry is not None:
-                dir_idx, exec_price = pending_entry
-                exec_price = self._slip(exec_price, dir_idx == 1)
-                trade_capital = cash * (self.qty_value / 100.0) if self.qty_type == "equity_pct" else min(self.qty_value, cash)
-                fee = trade_capital * self.fee_rate
-                total_fees += fee
-                qty = (trade_capital - fee) / exec_price
-                entry_price = exec_price
-                entry_time = t
-                pos_side = 1 if dir_idx == 1 else -1
-                cash -= trade_capital
-                pending_entry = None
+            # ── 1. Execute pending transition at this bar's open ──
+            if pending is not None:
+                target = pending
+                pending = None
+                if pos_side != 0 and pos_side != target:
+                    close_position(o, i, "signal")
+                if target != 0 and pos_side == 0:
+                    open_position(target, o, i)
 
-            # ── Check stop-loss / take-profit ──
-            if pos_side == 1:
+            # ── 2. Intra-bar stop-loss / take-profit ──
+            if pos_side == 1 and (self.stop_loss_pct or self.take_profit_pct):
                 sl = entry_price * (1.0 - self.stop_loss_pct) if self.stop_loss_pct else None
                 tp = entry_price * (1.0 + self.take_profit_pct) if self.take_profit_pct else None
-                exit_reason = None
-                exit_price_exec = None
-
-                if sl and l <= sl:
-                    exit_price_exec = self._slip(sl, False)
-                    exit_reason = "stop_loss"
-                elif tp and h >= tp:
-                    exit_price_exec = self._slip(tp, False)
-                    exit_reason = "take_profit"
-
-                if exit_reason:
-                    fee = exit_price_exec * qty * self.fee_rate
-                    total_fees += fee
-                    pnl = (exit_price_exec - entry_price) * qty
-                    inv = entry_price * qty
-                    net = pnl - fee
-                    cash = inv + pnl - fee
-                    trades.append(self._trade(entry_time, t, "LONG", entry_price, exit_price_exec, qty, net, exit_reason))
-                    pos_side = 0
-                    qty = 0.0
-                    entry_price = 0.0
-
-            elif pos_side == -1:
+                if sl is not None and l <= sl:
+                    close_position(sl, i, "stop_loss")
+                elif tp is not None and h >= tp:
+                    close_position(tp, i, "take_profit")
+            elif pos_side == -1 and (self.stop_loss_pct or self.take_profit_pct):
                 sl = entry_price * (1.0 + self.stop_loss_pct) if self.stop_loss_pct else None
                 tp = entry_price * (1.0 - self.take_profit_pct) if self.take_profit_pct else None
-                exit_reason = None
-                exit_price_exec = None
+                if sl is not None and h >= sl:
+                    close_position(sl, i, "stop_loss")
+                elif tp is not None and l <= tp:
+                    close_position(tp, i, "take_profit")
 
-                if sl and h >= sl:
-                    exit_price_exec = self._slip(sl, True)
-                    exit_reason = "stop_loss"
-                elif tp and l <= tp:
-                    exit_price_exec = self._slip(tp, True)
-                    exit_reason = "take_profit"
-
-                if exit_reason:
-                    fee = exit_price_exec * qty * self.fee_rate
-                    total_fees += fee
-                    pnl = (entry_price - exit_price_exec) * qty
-                    net = pnl - fee
-                    cash += net
-                    trades.append(self._trade(entry_time, t, "SHORT", entry_price, exit_price_exec, qty, net, exit_reason))
-                    pos_side = 0
-                    qty = 0.0
-                    entry_price = 0.0
-
-            # ── Mark-to-market equity ──
+            # ── 3. Mark-to-market equity at close ──
             if pos_side == 1:
                 equity_curve[i] = cash + qty * c
+                bars_in_market += 1
             elif pos_side == -1:
                 equity_curve[i] = cash + (entry_price - c) * qty
+                bars_in_market += 1
             else:
                 equity_curve[i] = cash
 
-            # ── Process signal (after computing equity for this bar) ──
-            sig = signals[i]
-
-            if pos_side == 0:
-                # Flat — check entry
+            # ── 4. Evaluate signal → schedule transition for next bar open ──
+            if i + 1 < n:
+                sig = signals[i]
                 if sig == 1:
-                    # Schedule entry at next bar open
-                    if i + 1 < n:
-                        pending_entry = (1, self._open[i + 1])
-                elif sig == -1 and not self.long_only:
-                    if i + 1 < n:
-                        pending_entry = (-1, self._open[i + 1])
+                    desired = 1
+                elif sig == -1:
+                    desired = 0 if self.long_only else -1
+                else:
+                    desired = 0
+                pending = desired if desired != pos_side else None
 
-            else:
-                # In position — check exit signal
-                should_exit = (pos_side == 1 and sig != 1) or (pos_side == -1 and sig != -1)
-                if should_exit:
-                    is_buy = (pos_side == -1)
-                    exit_price_exec = self._slip(c, not is_buy)
-                    fee = exit_price_exec * qty * self.fee_rate
-                    total_fees += fee
-                    side_str = "LONG" if pos_side == 1 else "SHORT"
-                    if pos_side == 1:
-                        pnl = (exit_price_exec - entry_price) * qty
-                        inv = entry_price * qty
-                        net = pnl - fee
-                        cash = inv + pnl - fee
-                    else:
-                        pnl = (entry_price - exit_price_exec) * qty
-                        net = pnl - fee
-                        cash += net
-                    trades.append(self._trade(entry_time, t, side_str, entry_price, exit_price_exec, qty, net, "signal"))
-                    pos_side = 0
-                    qty = 0.0
-                    entry_price = 0.0
-
-                    # Immediate re-entry if signal flipped (will execute at next bar)
-                    if sig == 1 and i + 1 < n:
-                        pending_entry = (1, self._open[i + 1])
-                    elif sig == -1 and not self.long_only and i + 1 < n:
-                        pending_entry = (-1, self._open[i + 1])
-
-            i += 1
-
-        # Force close at end of data
+        # ── Force close any open position at the last close ──
         if pos_side != 0:
-            c = self._close[-1]
-            t = self._time[-1]
-            exit_price_exec = self._slip(c, pos_side == -1)
-            fee = exit_price_exec * qty * self.fee_rate
-            total_fees += fee
-            side_str = "LONG" if pos_side == 1 else "SHORT"
-            if pos_side == 1:
-                pnl = (exit_price_exec - entry_price) * qty
-                inv = entry_price * qty
-                net = pnl - fee
-                cash = inv + pnl - fee
-            else:
-                pnl = (entry_price - exit_price_exec) * qty
-                net = pnl - fee
-                cash += net
-            trades.append(self._trade(entry_time, t, side_str, entry_price, exit_price_exec, qty, net, "end_of_data"))
+            close_position(self._close[-1], n - 1, "end_of_data")
             equity_curve[-1] = cash
 
-        return self._compute_metrics(equity_curve, trades, total_fees)
+        return self._compute_metrics(equity_curve, trades, total_fees, bars_in_market)
 
-    def _trade(self, entry_t, exit_t, side, entry_p, exit_p, qty, pnl, reason):
+    def _trade(self, entry_t, exit_t, side, entry_p, exit_p, qty, pnl, reason,
+               entry_bar, exit_bar):
         inv_val = entry_p * qty
         return {
             "entry_time": entry_t,
@@ -288,9 +326,12 @@ class Backtester:
             "pnl": pnl,
             "pnl_pct": pnl / inv_val * 100.0 if inv_val > 0 else 0.0,
             "exit_reason": reason,
+            "entry_bar": entry_bar,
+            "exit_bar": exit_bar,
+            "bars_held": exit_bar - entry_bar,
         }
 
-    def _compute_metrics(self, equity_curve, trades, total_fees):
+    def _compute_metrics(self, equity_curve, trades, total_fees, bars_in_market):
         n = len(equity_curve)
         initial = self.initial_capital
         final = equity_curve[-1] if n else initial
@@ -298,36 +339,37 @@ class Backtester:
         net_profit = final - initial
         total_return_pct = (net_profit / initial) * 100.0 if initial > 0 else 0.0
 
-        # Buy & Hold return
-        bnh_return = (self._close[-1] - self._close[0]) / self._close[0] * 100.0 if len(self._close) > 1 else 0.0
+        bnh_return = ((self._close[-1] - self._close[0]) / self._close[0] * 100.0
+                      if len(self._close) > 1 and self._close[0] > 0 else 0.0)
 
-        # ── Max Drawdown (TradingView matching: lookback peak) ──
+        # ── Max drawdown (track peak value at the trough) ──
         peak = initial
+        peak_at_trough = initial
         max_dd = 0.0
-        dd_peak_idx = 0
-        dd_trough_idx = 0
-        for i in range(n):
-            if equity_curve[i] > peak:
-                peak = equity_curve[i]
-                dd_peak_idx = i
-            dd = (peak - equity_curve[i]) / peak if peak > 0 else 0.0
+        for eq in equity_curve:
+            if eq > peak:
+                peak = eq
+            dd = (peak - eq) / peak if peak > 0 else 0.0
             if dd > max_dd:
                 max_dd = dd
-                dd_trough_idx = i
+                peak_at_trough = peak
         max_dd_pct = max_dd * 100.0
-        max_dd_dollar = peak - equity_curve[dd_trough_idx] if dd_trough_idx < n else 0.0
+        max_dd_dollar = peak_at_trough * max_dd
 
-        # ── Trade Stats ──
+        # ── Trade statistics ──
         num_trades = len(trades)
-        win_count = sum(1 for t in trades if t["pnl"] > 0)
-        lose_count = num_trades - win_count
-        win_rate_pct = (win_count / num_trades * 100.0) if num_trades > 0 else 0.0
-
         wins = [t for t in trades if t["pnl"] > 0]
         losses = [t for t in trades if t["pnl"] <= 0]
-        total_profit = sum(t["pnl"] for t in wins) if wins else 0.0
-        total_loss = abs(sum(t["pnl"] for t in losses)) if losses else 0.0
-        profit_factor = total_profit / total_loss if total_loss > 0 else (float("inf") if total_profit > 0 else 0.0)
+        win_count = len(wins)
+        lose_count = len(losses)
+        win_rate_pct = (win_count / num_trades * 100.0) if num_trades > 0 else 0.0
+
+        total_profit = sum(t["pnl"] for t in wins)
+        total_loss = abs(sum(t["pnl"] for t in losses))
+        if total_loss > 0:
+            profit_factor = total_profit / total_loss
+        else:
+            profit_factor = float("inf") if total_profit > 0 else 0.0
 
         avg_win = total_profit / win_count if win_count > 0 else 0.0
         avg_loss = total_loss / lose_count if lose_count > 0 else 0.0
@@ -338,10 +380,7 @@ class Backtester:
         largest_win_pct = max((t["pnl_pct"] for t in trades), default=0.0)
         largest_loss_pct = min((t["pnl_pct"] for t in trades), default=0.0)
 
-        # Consecutive wins/losses
-        max_consec_w = 0
-        max_consec_l = 0
-        cw, cl = 0, 0
+        max_consec_w = max_consec_l = cw = cl = 0
         for t in trades:
             if t["pnl"] > 0:
                 cw += 1; cl = 0
@@ -350,79 +389,61 @@ class Backtester:
                 cl += 1; cw = 0
                 max_consec_l = max(max_consec_l, cl)
 
-        # Avg duration
-        avg_duration_hrs = 0.0
-        avg_bars_held = 0.0
-        bars_in_trade = 0.0
+        # ── Durations (bar-based, timeframe-aware) ──
+        hours_per_bar = self._interval / 3600.0
         if trades:
-            durations = []
-            for t in trades:
-                try:
-                    et = datetime.datetime.strptime(t["entry_time"], "%Y-%m-%d %H:%M:%S")
-                    xt = datetime.datetime.strptime(t["exit_time"], "%Y-%m-%d %H:%M:%S")
-                    hrs = (xt - et).total_seconds() / 3600.0
-                    durations.append(hrs)
-                    bars_in_trade += hrs
-                except (ValueError, TypeError):
-                    pass
-            if durations:
-                avg_duration_hrs = sum(durations) / len(durations)
-                avg_bars_held = avg_duration_hrs
+            avg_bars_held = sum(t["bars_held"] for t in trades) / num_trades
+        else:
+            avg_bars_held = 0.0
+        avg_duration_hrs = avg_bars_held * hours_per_bar
+        exposure_pct = (bars_in_market / n * 100.0) if n > 0 else 0.0
 
-        exposure_pct = (bars_in_trade / n * 100.0) if n > 0 else 0.0
-
-        # ── Return series for ratios ──
+        # ── Per-bar returns ──
         bar_returns = []
         for i in range(1, n):
             prev = equity_curve[i - 1]
             if prev > 0:
                 bar_returns.append((equity_curve[i] - prev) / prev)
 
-        # ── Sharpe Ratio (annualized) ──
+        periods_per_year = SECONDS_PER_YEAR / self._interval if self._interval > 0 else 8760.0
+
+        # ── Sharpe / Sortino (annualised) ──
         sharpe = 0.0
+        sortino = 0.0
         if len(bar_returns) > 5:
             mean_r = sum(bar_returns) / len(bar_returns)
             var_r = sum((r - mean_r) ** 2 for r in bar_returns) / len(bar_returns)
             std_r = math.sqrt(var_r)
-            if std_r > 1e-10:
-                # Annualize: sqrt(periods_per_year)
-                # For hourly: 365*24=8760; for 5m: 365*24*12=105120
-                periods_per_year = max(len(bar_returns) / (n / 8760.0), 1.0) if n > 0 else 8760
-                periods_per_year = min(periods_per_year, 200000)
-                annual_factor = math.sqrt(periods_per_year)
-                sharpe = (mean_r / std_r) * annual_factor
-
-        # ── Sortino ──
-        sortino = 0.0
-        negative_returns = [r for r in bar_returns if r < 0]
-        if negative_returns and len(bar_returns) > 5:
-            down_var = sum(r * r for r in negative_returns) / len(negative_returns)
-            down_std = math.sqrt(down_var)
-            if down_std > 1e-10:
-                periods_per_year = max(len(bar_returns) / (n / 8760.0), 1.0) if n > 0 else 8760
-                sortino = (mean_r / down_std) * math.sqrt(periods_per_year)
+            ann = math.sqrt(periods_per_year)
+            if std_r > 1e-12:
+                sharpe = (mean_r / std_r) * ann
+            downside = [r for r in bar_returns if r < 0]
+            if downside:
+                down_std = math.sqrt(sum(r * r for r in downside) / len(downside))
+                if down_std > 1e-12:
+                    sortino = (mean_r / down_std) * ann
+            elif mean_r > 0:
+                sortino = float("inf")
 
         # ── Calmar ──
         calmar = total_return_pct / max_dd_pct if max_dd_pct > 0 else 0.0
 
-        # ── CAGR ──
-        total_hours = n  # 1 bar = 1 hour for hourly data
-        years = total_hours / (365.25 * 24.0)
-        cagr = ((final / initial) ** (1.0 / years) - 1.0) * 100.0 if years > 0.5 and initial > 0 else 0.0
+        # ── CAGR (timeframe-aware) ──
+        years = (n * self._interval) / SECONDS_PER_YEAR
+        if years > 1e-9 and initial > 0 and final > 0:
+            cagr = ((final / initial) ** (1.0 / years) - 1.0) * 100.0
+        else:
+            cagr = 0.0
 
         # ── Expectancy ──
         if num_trades > 0:
-            w_pct = win_count / num_trades
-            l_pct = lose_count / num_trades
-            expectancy = w_pct * avg_win - l_pct * avg_loss
+            expectancy = (win_count / num_trades) * avg_win - (lose_count / num_trades) * avg_loss
         else:
             expectancy = 0.0
 
-        # ── P&L by side ──
         long_pnl = sum(t["pnl"] for t in trades if t["side"] == "LONG")
         short_pnl = sum(t["pnl"] for t in trades if t["side"] == "SHORT")
 
-        # ── Equity curve dicts ──
         eq_dicts = [{"datetime": self._time[i], "equity": equity_curve[i]} for i in range(n)]
 
         return {
@@ -453,6 +474,7 @@ class Backtester:
             "avg_trade_duration_hours": avg_duration_hrs,
             "avg_bars_held": avg_bars_held,
             "exposure_pct": exposure_pct,
+            "bar_interval_seconds": self._interval,
             "sharpe_ratio": sharpe,
             "sortino_ratio": sortino,
             "calmar_ratio": calmar,
@@ -467,6 +489,13 @@ class Backtester:
     def print_report(results):
         label_w = 28
         val_w = 22
+
+        def fmt(x):
+            if x == float("inf"):
+                return "inf"
+            if x == float("-inf"):
+                return "-inf"
+            return x
 
         def row(label, value):
             print(f"  {label:<{label_w}} {value:>{val_w}}")
@@ -490,10 +519,11 @@ class Backtester:
         row("Max Drawdown $", f"${results['max_drawdown_dollar']:,.2f}")
         print()
         print("  ── RATIOS ──")
-        row("Sharpe Ratio", f"{results['sharpe_ratio']:.3f}")
-        row("Sortino Ratio", f"{results['sortino_ratio']:.3f}")
+        row("Sharpe Ratio", f"{fmt(results['sharpe_ratio']):.3f}" if results['sharpe_ratio'] not in (float('inf'), float('-inf')) else "inf")
+        row("Sortino Ratio", f"{fmt(results['sortino_ratio']):.3f}" if results['sortino_ratio'] not in (float('inf'), float('-inf')) else "inf")
         row("Calmar Ratio", f"{results['calmar_ratio']:.3f}")
-        row("Profit Factor", f"{results['profit_factor']:.2f}")
+        pf = results['profit_factor']
+        row("Profit Factor", "inf" if pf == float("inf") else f"{pf:.2f}")
         print()
         print("  ── TRADE STATISTICS ──")
         row("Total Trades", f"{results['num_trades']}")
@@ -534,7 +564,8 @@ class Backtester:
         trades_file = os.path.join(DATA_DIR, f"{prefix}_trades.csv")
         if results["trades"]:
             fields = ["entry_time", "exit_time", "side", "entry_price", "exit_price",
-                      "qty", "pnl", "pnl_pct", "exit_reason"]
+                      "qty", "pnl", "pnl_pct", "exit_reason", "entry_bar", "exit_bar",
+                      "bars_held"]
             with open(trades_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader()

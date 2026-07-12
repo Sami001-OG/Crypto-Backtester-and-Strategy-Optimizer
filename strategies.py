@@ -171,18 +171,24 @@ def adx_strategy(data, period=14, threshold=25):
 
 
 def donchian_breakout(data, period=20):
-    """Buy on breakout of Donchian high, sell on breakdown of Donchian low."""
+    """
+    Donchian breakout: go long when price closes above the PRIOR bar's Donchian
+    high, short when it closes below the prior bar's Donchian low. Comparing to
+    the previous bar's channel (which excludes the current bar) is what makes a
+    breakout detectable — the current bar's own high always defines its channel
+    top, so ``close > upper[i]`` can never be true.
+    """
     highs = [d["high"] for d in data]
     lows = [d["low"] for d in data]
     closes = [d["close"] for d in data]
     dc_upper, dc_lower, dc_basis = ind.donchian_channels(highs, lows, period)
     signals = [0] * len(data)
     for i in range(1, len(data)):
-        if dc_upper[i] is None or dc_lower[i] is None:
+        if dc_upper[i - 1] is None or dc_lower[i - 1] is None:
             continue
-        if closes[i] > dc_upper[i]:
+        if closes[i] > dc_upper[i - 1]:
             signals[i] = 1
-        elif closes[i] < dc_lower[i]:
+        elif closes[i] < dc_lower[i - 1]:
             signals[i] = -1
         else:
             signals[i] = signals[i - 1]
