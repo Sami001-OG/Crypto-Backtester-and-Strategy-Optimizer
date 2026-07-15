@@ -2,17 +2,21 @@
 
 A TradingView-compatible backtesting framework for crypto strategies. Pure Python, zero external dependencies.
 
+The engine replicates **TradingView's Strategy Tester** — the broker emulator's fill rules, percent-of-equity sizing, intrabar drawdown, and the Performance Summary formulas — so a strategy ported from Pine Script produces the same trades and the same headline numbers here.
+
 ---
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `backtester.py` | Core engine — bar-magnitude execution, 30+ metrics, stop/take-profit |
-| `indicators.py` | 31 technical indicators matching TradingView's pine script output |
-| `strategies.py` | 14 built-in strategies plus multi-timeframe composites |
+| `backtester.py` | Core engine — TV broker-emulator execution, Performance Summary metrics |
+| `indicators.py` | Technical indicators, exact ports of Pine `ta.*` built-ins |
+| `strategies.py` | 16 built-in strategies plus multi-timeframe composites |
 | `optimizer.py` | Parallel grid search, walk-forward, and adaptive random search |
-| `download_data.py` | Downloads monthly kline CSVs from Binance Vision |
+| `test_tv_parity.py` | 115 hand-computed TV-parity checks — run `python test_tv_parity.py` |
+| `download_data.py` | Downloads full-history monthly kline CSVs from Binance Vision |
+| `update_data.py` | Incrementally tops up the CSVs to the latest closed bar (Binance REST) |
 | `preprocess_data.py` | Converts raw timestamps, adds datetime/returns columns |
 
 ---
@@ -31,215 +35,155 @@ results = bt.run(signals)
 Backtester.print_report(results)
 ```
 
-Output:
+---
 
-```
-            STRATEGY TESTER REPORT
-═══════════════════════════════════════════════
-  ── PERFORMANCE ──
-  Net Profit                       $13,336.94
-  Net Profit %                        133.37%
-  CAGR                                 15.41%
-  ── RISK ──
-  Max Drawdown %                       63.52%
-  ── RATIOS ──
-  Sharpe Ratio                          0.557
-  Sortino Ratio                         0.433
-  Profit Factor                          1.10
-  ── TRADE STATISTICS ──
-  Total Trades                            914
-  Win Rate                             27.68%
-  Avg Trade Duration                    28.8h
-```
+## Execution model (TradingView broker emulator)
+
+Every rule below matches TV's documented behavior:
+
+1. **Order timing** — market orders are created on the signal bar's close and fill at the **next bar's open** (entries and signal exits alike). Set `process_orders_on_close=True` for TV's same-close fill option.
+2. **Position sizing** (`qty_type="equity_pct"`) — quantity is fixed when the order is *created*: `qty = pct% × strategy.equity / signal-bar close`, where equity = initial + closed net profit + open position P&L. The order then fills at the next open with that quantity — TV's documented "sizing drift", reproduced deliberately. `qty_step` rounds down to the symbol's minimum order size (TV: 0.000001 for BTCUSD) and skips sub-minimum orders.
+3. **Stop-loss / take-profit** — resting stop/limit orders, active from the moment the entry fills (they can close the trade on the **entry bar itself**, like `strategy.exit` placed with the entry).
+4. **Gap rule** — if a bar *opens* beyond the stop/limit price, the fill happens at the open, not at the order price.
+5. **Intrabar path assumption** — when both SL and TP sit inside one bar, the emulator assumes price moved **open → high → low → close** if the open is closer to the high, else **open → low → high → close**, and fills whichever order that path touches first. (TV Premium's Bar Magnifier is not emulated — that needs lower-timeframe data.)
+6. **Slippage** — `slippage_ticks` (TV-style) applies adversely to market and stop fills; **limit fills are never slipped**. `slippage_pct` is a non-TV convenience with the same rules.
+7. **Commission** — `fee_pct` % of order value on every fill, deducted from equity (TV "commission percent").
+8. **Margin** — none (TV Pine v5 default `margin_long = margin_short = 0`): orders always fill, fees can push cash slightly negative, and no margin-call liquidation is simulated. A 1x short that gets run over can take equity below zero — same as TV with margin 0.
+9. **End of data** — an open position is *left open* (TV behavior): `net_profit` counts closed trades only, the open trade is reported in `open_trade` / `open_pnl`, and `final_equity` includes it. Set `force_close_end=True` for realized-only accounting.
+
+### Signals
+
+A strategy returns a *state* list, one int per bar: `1` = want long, `-1` = want short (or exit-to-flat when `long_only=True`), `0` = flat. The engine diffs that state against the current position each close and issues the orders — equivalent to calling `strategy.entry()` while the condition holds.
 
 ---
 
-## Execution Model
+## Metrics (TV Performance Summary)
 
-Matches **TradingView's Strategy Tester**:
+| TV row | Key | Notes |
+|--------|-----|-------|
+| Net Profit | `net_profit`, `net_profit_pct` | Closed trades only, commissions included |
+| Open P&L | `open_pnl`, `open_trade` | Unrealized, reported separately like TV |
+| Gross Profit / Loss | `gross_profit`, `gross_loss` | |
+| Buy & Hold Return | `buy_and_hold_return_pct` | All funds in at the **first trade's entry**, held to the last close |
+| Max Equity Drawdown | `max_drawdown_dollar`, `max_drawdown_pct` | **Intrabar**: uses bar low/high equity while in a position, path-ordered on exit bars (TV's documented formula) |
+| Max Equity Run-up | `max_runup_dollar`, `max_runup_pct` | Intrabar, mirror of drawdown |
+| Sharpe Ratio | `sharpe_ratio` | TV formula: **monthly** equity returns, `(MR − RFR/12) / population stdev`, default `risk_free_rate=2` %/yr, **not annualized**. Needs ≥ 2 completed calendar months (`months_used`) |
+| Sortino Ratio | `sortino_ratio` | Same, denominator = downside deviation `sqrt(Σ r<0 r² / N)` |
+| Profit Factor | `profit_factor` | gross profit / gross loss |
+| Commission Paid | `commission_paid` (= `total_fees`) | |
+| Total / Winning / Losing Trades | `num_trades`, `num_winning`, `num_losing`, `num_even` | Breakeven trades count in the total, neither win nor loss |
+| Percent Profitable | `win_rate_pct` | wins / total closed |
+| Avg P&L, Avg Win, Avg Loss, Ratio | `avg_pnl`, `avg_win`, `avg_loss`, `ratio_avg_win_loss` | |
+| Largest Win / Loss | `max_win_dollar`, `max_loss_dollar`, `largest_win_pct`, `largest_loss_pct` | % is trade P&L over entry value |
+| Avg # Bars in Trades / Wins / Losses | `avg_bars_held`, `avg_bars_win`, `avg_bars_loss` | |
 
-1. **Bar-magnitude**: signal generated at bar `i` → executes at bar `i+1` open (no lookahead). Entries *and* signal-based exits both fill at the next open — symmetric, no bias.
-2. **Stop/Take-profit**: checked intra-bar using high/low — stop uses low for longs (high for shorts), take-profit the opposite. Stop is evaluated before take-profit.
-3. **Commission**: applied on every fill as % of order value (TV default: 0.04% for crypto).
-4. **Slippage**: configurable as % of price or tick count (`tick_size` configurable).
-5. **Cash accounting**: equity equals cash whenever flat, for *any* position size — `qty_value < 100` keeps the remainder in cash, and shorts are modelled at 1x with margin held against notional.
-6. **Timeframe-aware**: the bar interval is inferred from timestamps, so Sharpe, Sortino, CAGR, exposure and trade durations are correct for 5m / 15m / 1h / 4h / 1d data.
-
----
-
-## Indicators (31 total)
-
-All match TradingView's pine script `ta.*` output:
-
-| Indicator | TV Equivalent | Notes |
-|-----------|---------------|-------|
-| SMA | `ta.sma` | Running sum, O(n) |
-| EMA | `ta.ema` | SMA seed, `2/(n+1)` multiplier |
-| RSI | `ta.rsi` | Wilder's RMA smoothing, not EMA |
-| MACD | `ta.macd` | EMA of MACD for signal line |
-| Bollinger Bands | `ta.bb` | Population std (n), not sample std |
-| ATR | `ta.atr` | RMA (Wilder's) smoothing |
-| SuperTrend | `ta.supertrend` | Band clamping, hl2 source |
-| ADX | `ta.adx` | RMA on +DM/-DM, RMA on DX |
-| Stochastic | `ta.stoch` | SMA of %K for %D |
-| VWAP | `ta.vwap` | Cumulative typical price × volume |
-| Donchian | `ta.donchian` | 20-period by default |
-| Keltner | `ta.keltner` | EMA basis, ATR multiplier |
-
-Batch compute all at once:
-
-```python
-from indicators import compute_all
-all_indicators = compute_all(data)
-# all_indicators["rsi_14"], all_indicators["macd_line"], etc.
-```
+Extras beyond TV (kept for the optimizer): `cagr_pct`, `calmar_ratio`, `expectancy`, `exposure_pct`, `avg_trade_duration_hours`, `monthly_returns`, `long_pnl` / `short_pnl`, `total_return_pct` (includes open P&L).
 
 ---
 
-## Strategies (14 built-in)
+## Indicators — exact Pine `ta.*` ports
 
-| Strategy | Parameters |
-|----------|------------|
-| `sma_crossover` | fast_period, slow_period |
-| `ema_crossover` | fast_period, slow_period |
-| `golden_cross` | fast_period=50, slow_period=200 |
-| `rsi` | period, oversold=30, overbought=70 |
-| `macd` | fast=12, slow=26, signal_period=9 |
-| `bollinger` | period=20, num_std=2 |
-| `supertrend` | period=10, multiplier=3 |
-| `stochastic` | k_period=14, d_period=3, oversold=20, overbought=80 |
-| `adx` | period=14, threshold=25 |
-| `donchian` | period=20 |
-| `vwap_reversion` | lookback=20 |
-| `mtf_alignment` | Higher-TF trend filter on lower-TF RSI entries |
-| `bband_squeeze` | Bollinger squeeze breakout |
-| `triple_ema` | Triple EMA alignment |
+| Indicator | TV equivalent | Parity details |
+|-----------|---------------|----------------|
+| SMA | `ta.sma` | na-aware window (na until a full clean window) |
+| EMA | `ta.ema` | Pine recursion: na until seeded with the SMA of the first full non-na window, `alpha = 2/(n+1)` |
+| RMA | `ta.rma` | Same, `alpha = 1/n` (Wilder) |
+| RSI | `ta.rsi` | `100 − 100/(1 + rma(up)/rma(down))`; 100 when avg loss is 0 |
+| MACD | `ta.macd` | Signal = EMA of the (na-led) MACD line, SMA-seeded like Pine |
+| Bollinger | `ta.bb` | Population stdev (÷ n) |
+| ATR | `ta.atr` | `rma(ta.tr(handle_na=true))` — first bar TR = high − low |
+| ADX / DMI | built-in DMI | Line-by-line port: `ta.tr` **na on bar 0**, RMA chains, `fixnan()` on the DIs, DX guarded with `sum == 0 ? 1 : sum`. First ADX value lands at bar `2·len − 1`, like TV |
+| SuperTrend | `ta.supertrend` | Line-by-line port of the Pine v5 source (nz() band seeding, close[1] ratchets, first value on the first ATR bar, seeded as downtrend). **Convention:** here `direction = 1` means uptrend — the *negation* of TV's return (TV uses −1 for up). Values are identical |
+| Stochastic | built-in Stochastic | raw `ta.stoch` (na when window range is 0), `%K = sma(raw, smooth_k)`, `%D = sma(%K, d)`; TV defaults 14/3/1 |
+| VWAP | `ta.vwap` | **Session-anchored** — resets each UTC day via `anchors=day_keys(data)`; hlc3 source. `anchors=None` = cumulative |
+| Donchian | Donchian Channels | highest/lowest incl. current bar |
+| Keltner | built-in KC | Basis = **EMA(close, 20)** (close source, TV default), bands ± 2 × ATR(10) |
+| Pivots | `ta.pivothigh/low` | Strict comparisons; value stored at the pivot bar. Use `pivots_confirmed(ph, right_bars)` to shift values to the bar TV would confirm them — **required to avoid lookahead** |
 
-Add your own — just write a function that returns `list[int]` (1=long, -1=short, 0=flat) and register it in the `STRATEGIES` dict.
+`swing_highs_lows()` is centered (uses future bars) — research only; `detect_bos()` now acts only on confirmed swings.
+
+**Timestamps:** `load_data` / `day_keys` normalize Unix timestamps in seconds, **milliseconds or microseconds** (Binance switched klines to µs on 2025-01-01, so one CSV can mix units — handled).
+
+---
+
+## Strategies (16 built-in)
+
+`sma_crossover`, `ema_crossover`, `golden_cross`, `rsi`, `macd`, `bollinger`, `supertrend`, `stochastic`, `adx`, `donchian`, `vwap_reversion` (session VWAP), `mtf_alignment`, `bband_squeeze`, `triple_ema`, `calm_trend`, `pulse_futures`.
+
+Add your own — write a function returning `list[int]` (1/-1/0 state per bar) and register it in `STRATEGIES`.
 
 ---
 
 ## Optimizer
 
-Brute-force: backtests **every** parameter combination for a given strategy/indicator and ranks them, so you can find the best-performing set. Ranking is descending by default, ascending for `max_drawdown_pct` / `total_fees`. `min_trades` filters degenerate combos. Parallelism uses **processes** (not threads), so pure-Python backtests actually use every core; data is loaded once per worker.
-
-### Grid Search (parallel)
+Brute-force grid search, walk-forward (train/test, no leak), rolling walk-forward, and adaptive random search. Parallelism uses **processes**, so pure-Python backtests use every core; data loads once per worker.
 
 ```python
-from optimizer import grid_search
+from optimizer import grid_search, walk_forward, rolling_walk_forward, adaptive_search
 
 best = grid_search(
     "BTC_1h.csv", "sma_crossover",
     {"fast_period": [10, 20, 50], "slow_period": [100, 200]},
-    rank_by="sharpe_ratio",   # or "total_return_pct", "profit_factor", "calmar_ratio"
-    min_trades=10,            # skip combos with too few trades
+    rank_by="sharpe_ratio",   # TV monthly Sharpe; or total_return_pct, calmar_ratio…
+    min_trades=10,
     parallel=True,
 )
 best_params = best[0]["params"]
 ```
 
-### Walk-Forward (no lookahead)
-
-Grid-searches on the training slice **only**, then evaluates the winner out-of-sample:
-
-```python
-from optimizer import walk_forward
-
-params, train_metrics, test_metrics = walk_forward(
-    "BTC_1h.csv", "rsi",
-    {"period": [7, 14, 21], "oversold": [25, 30], "overbought": [70, 75]},
-    train_ratio=0.7,
-)
-```
-
-### Rolling Walk-Forward (N folds)
-
-```python
-from optimizer import rolling_walk_forward
-
-fold_results = rolling_walk_forward(
-    "BTC_1h.csv", "ema_crossover",
-    {"fast_period": [5, 10, 20], "slow_period": [30, 50, 100]},
-    windows=4,
-)
-```
-
-### Adaptive Random Search
-
-For large parameter spaces (>10⁶ combos). Explores randomly, then refines around the best point found:
-
-```python
-from optimizer import adaptive_search
-
-best = adaptive_search(
-    "BTC_1h.csv", "bollinger",
-    {"period": (5, 100, "int"), "num_std": (1.0, 4.0, "float")},
-    iterations=500,
-)
-```
-
-Spec types: `(low, high, "int")`, `(low, high, "float")`, `(low, high, "bool")`, `(low, high, "choice", [a, b, c])`.
+`walk_forward(...)` grid-searches the train slice only, then evaluates out-of-sample. `adaptive_search(...)` handles huge spaces with random exploration + refinement.
 
 ---
 
-## Metrics (30+)
-
-All returned in the results dict:
-
-| Metric | Key | Description |
-|--------|-----|-------------|
-| Net Profit | `net_profit` | Final equity minus initial |
-| Return % | `total_return_pct` | Total return as percentage |
-| Buy & Hold % | `buy_and_hold_return_pct` | Benchmark return |
-| CAGR % | `cagr_pct` | Compound annual growth rate |
-| Max Drawdown % | `max_drawdown_pct` | Largest peak-to-trough decline |
-| Max Drawdown $ | `max_drawdown_dollar` | Dollar value of max DD |
-| Sharpe Ratio | `sharpe_ratio` | Risk-adjusted return (annualized) |
-| Sortino Ratio | `sortino_ratio` | Downside risk-adjusted return |
-| Calmar Ratio | `calmar_ratio` | Return / max drawdown |
-| Profit Factor | `profit_factor` | Gross profit / gross loss |
-| Win Rate | `win_rate_pct` | Percentage of winning trades |
-| Expectancy | `expectancy` | Average expected P&L per trade |
-| Exposure | `exposure_pct` | Percentage of time in market |
-| Total Fees | `total_fees` | Sum of all commissions paid |
-| Long P&L | `long_pnl` | Net P&L from long trades |
-| Short P&L | `short_pnl` | Net P&L from short trades |
-
----
-
-## Data Pipeline
-
-```
-download_data.py ──► raw CSVs ──► preprocess_data.py ──► clean CSVs
-  (Binance Vision)                                          (for backtest)
-```
-
-- **Download**: `python download_data.py` — fetches monthly zips from Binance Vision for BTC, ETH, SOL at 5m/15m/1h/4h
-- **Preprocess**: `python preprocess_data.py` — converts Unix ms timestamps to `datetime`, adds `returns` column
-- Expected CSV columns: `open_time, open, high, low, close, volume, close_time, quote_volume, trades, datetime, returns`
-
----
-
-## Backtester Parameters
+## Backtester parameters
 
 ```python
 Backtester(
     data,                          # list of dicts from load_data()
-    initial_capital=10000,         # starting capital in USD
-    fee_pct=0.04,                  # commission per trade (%)
-    slippage_ticks=0,              # slippage in ticks
-    slippage_pct=0.0,              # slippage as % of price
-    stop_loss_pct=None,            # stop loss % (e.g. 2 = 2%)
-    take_profit_pct=None,          # take profit % (e.g. 5 = 5%)
-    long_only=True,                # restrict to long trades only
-    pyramiding=1,                  # max concurrent positions
-    qty_type="equity_pct",         # "equity_pct" or "fixed"
-    qty_value=100,                 # % of equity or fixed units
+    initial_capital=10000,
+    fee_pct=0.04,                  # commission % per fill
+    slippage_ticks=0,              # TV slippage (market & stop fills only)
+    slippage_pct=0.0,              # extra % slippage, same rules (non-TV)
+    tick_size=0.01,
+    stop_loss_pct=None,            # % from entry fill (stop order)
+    take_profit_pct=None,          # % from entry fill (limit order)
+    long_only=True,
+    qty_type="equity_pct",         # or "fixed" (contracts)
+    qty_value=100,
+    qty_step=None,                 # min order size (BTCUSD on TV: 1e-6)
+    process_orders_on_close=False, # TV option: fill on the signal close
+    force_close_end=False,         # True = realized-only (non-TV)
+    risk_free_rate=2.0,            # annual %, for Sharpe/Sortino (TV: 2)
 )
 ```
 
 ---
 
+## Verification
+
+`python test_tv_parity.py` — 115 checks, every expectation hand-computed from TV's documented formulas (Pine v5 reference sources and Strategy Tester help pages): EMA/RMA/RSI/MACD/ADX/SuperTrend/Stochastic/VWAP values, gap fills, same-bar SL/TP path ordering, sizing-at-creation, the TV intrabar-drawdown worked example, monthly Sharpe/Sortino, breakeven-trade accounting, and more.
+
+Known gaps vs TV (documented, deliberate): no Bar Magnifier (needs LTF data), no margin-call liquidation (TV v5 default margin = 0 has none either), Pine v6 default margin (100%) not modeled, `calc_on_every_tick` not modeled.
+
+---
+
+## Layout
+
+This folder contains **only the framework** (engine, indicators, strategies, optimizer, tests, data pipeline). Everything built *with* it — `endellion.py`, `run_regime_futures.py`, the `research/` experiments — lives in the `crypto_data` root alongside the market data, and imports the framework from here.
+
+## Data pipeline
+
+All market data lives in **one canonical location: the `crypto_data` root folder** (the parent of this package). `load_data("BTC_1h.csv")` resolves there automatically; nothing is duplicated into this folder.
+
+```
+download_data.py ──► full-history CSVs ──► update_data.py (incremental top-up)
+  (Binance Vision monthly zips)              (Binance REST, last CLOSED bar)
+```
+
+- `python update_data.py` — appends only the missing bars to every `BTC_*.csv` (5m/15m/1h/4h/1d), never writes the still-forming candle, refuses to append across gaps, and preserves each file's schema and timestamp unit (ms or µs).
+- Required CSV columns: `open, high, low, close, volume`; optional `datetime` (labels) and `open_time` (Unix s/ms/µs — used for sessions and monthly Sharpe buckets).
+- Known data hole: Binance halted spot trading 2023-03-24 ≈12:35–14:00 UTC, so no 5m/15m/1h candles exist for that window — TradingView's Binance charts have the identical gap.
+
 ## Requirements
 
-Python 3.7+ — **no pip packages required** (standard library only: `csv`, `os`, `math`, `datetime`, `random`, `urllib`, `zipfile`, `io`, `itertools`, `concurrent.futures`, `multiprocessing`)
+Python 3.7+ — no pip packages (standard library only).

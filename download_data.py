@@ -13,7 +13,8 @@ import io
 import time
 
 BASE_URL = "https://data.binance.vision/data/spot/monthly/klines"
-OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+# All market data lives in the crypto_data root (parent of this folder).
+OUTPUT_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 SYMBOLS = ["BTCUSDT", "SOLUSDT", "ETHUSDT"]
 INTERVALS = ["5m", "15m", "1h", "4h"]
